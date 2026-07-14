@@ -158,7 +158,15 @@ def train(args):
 
     pl.seed_everything(args.seed, workers=True)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Pin each DDP worker to its own GPU: this runs before Lightning assigns
+    # devices, and defaulting to "cuda" would stack all workers' model builds
+    # (base + fp32 adapter params) on GPU 0 — OOM at high LoRA ranks.
+    if torch.cuda.is_available():
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device("cpu")
     model, model_config = load_model(args.model, args.model_config, device)
 
     latent_rate = model_config["sample_rate"] / model.pretransform.downsampling_ratio
