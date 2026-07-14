@@ -11,6 +11,10 @@ from stable_audio_3.models.conditioners import (
     NumberConditioner,
     T5GemmaConditioner,
 )
+from stable_audio_3.models.conditioners_splicegen import (
+    CycleConditioner,
+    FeatureConditioner,
+)
 from stable_audio_3.models.bottleneck import SoftNormBottleneck
 from stable_audio_3.models.pretransforms import (
     PatchedPretransform,
@@ -136,6 +140,8 @@ def create_multi_conditioner_from_conditioning_config(
 
     pre_encoded_keys = config.get("pre_encoded_keys", [])
 
+    extra_keys = config.get("extra_keys", {})
+
     for conditioner_info in config["configs"]:
         id = conditioner_info["id"]
 
@@ -149,9 +155,20 @@ def create_multi_conditioner_from_conditioning_config(
             conditioners[id] = T5GemmaConditioner(**conditioner_config)
         elif conditioner_type == "number":
             conditioners[id] = NumberConditioner(**conditioner_config)
+        elif conditioner_type == "feature":
+            # Only pre-encoded features are supported: the dataset supplies the
+            # pre-computed feature arrays and the extractor is an identity.
+            if not conditioner_info.get("pre_encoded", False):
+                raise ValueError(
+                    f"Feature conditioner '{id}' must set pre_encoded=true; "
+                    "live feature extraction is not supported in stable-audio-3."
+                )
+            conditioners[id] = FeatureConditioner(**conditioner_config)
+        elif conditioner_type == "cycle":
+            conditioners[id] = CycleConditioner(**conditioner_config)
         else:
             raise ValueError(f"Unknown conditioner type: {conditioner_type}")
 
     return MultiConditioner(
-        conditioners, default_keys=default_keys, pre_encoded_keys=pre_encoded_keys
+        conditioners, default_keys=default_keys, pre_encoded_keys=pre_encoded_keys, extra_keys=extra_keys
     )

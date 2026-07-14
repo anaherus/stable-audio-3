@@ -276,38 +276,53 @@ class MultiConditioner(nn.Module):
     Args:
         conditioners: a dictionary of conditioners with keys corresponding to the keys of the conditioning input dictionary (e.g. "prompt")
         default_keys: a dictionary of default keys to use if the key is not in the input dictionary (e.g. {"prompt_t5": "prompt"})
+        extra_keys: a dictionary mapping a conditioner key to additional metadata keys it consumes
+            (e.g. {"bpm": ["seconds_start", "seconds_total"]}). Conditioners with extra keys receive
+            a list of per-sample dicts instead of a list of raw values.
     """
-    def __init__(self, conditioners: tp.Dict[str, Conditioner], default_keys: tp.Dict[str, str] = {}, pre_encoded_keys: tp.List[str] = []):
+    def __init__(self, conditioners: tp.Dict[str, Conditioner], default_keys: tp.Dict[str, str] = {}, pre_encoded_keys: tp.List[str] = [], extra_keys: tp.Dict[str, tp.List[str]] = {}):
         super().__init__()
 
         self.conditioners = nn.ModuleDict(conditioners)
         self.default_keys = default_keys
         self.pre_encoded_keys = pre_encoded_keys
+        self.extra_keys = extra_keys
 
     def forward(self, batch_metadata: tp.List[tp.Dict[str, tp.Any]], device: tp.Union[torch.device, str]) -> tp.Dict[str, tp.Any]:
         output = {}
 
         for key, conditioner in self.conditioners.items():
-            condition_key = key
+            condition_keys = [key]
+
+            if key in self.extra_keys:
+                condition_keys = condition_keys + list(self.extra_keys[key])
 
             conditioner_inputs = []
 
             for x in batch_metadata:
+                input_dict = {}
 
-                if condition_key not in x:
-                    if condition_key in self.default_keys:
-                        condition_key = self.default_keys[condition_key]
+                for condition_key in condition_keys:
+                    effective_key = condition_key
+
+                    if effective_key not in x:
+                        if effective_key in self.default_keys:
+                            effective_key = self.default_keys[effective_key]
+                        else:
+                            raise ValueError(f"Conditioner key {effective_key} not found in batch metadata")
+
+                    #Unwrap the condition info if it's a single-element list or tuple, this is to support collation functions that wrap everything in a list
+                    if isinstance(x[effective_key], list) or isinstance(x[effective_key], tuple) and len(x[effective_key]) == 1:
+                        input_dict[condition_key] = x[effective_key][0]
                     else:
-                        raise ValueError(f"Conditioner key {condition_key} not found in batch metadata")
+                        input_dict[condition_key] = x[effective_key]
 
-                #Unwrap the condition info if it's a single-element list or tuple, this is to support collation functions that wrap everything in a list
-                if isinstance(x[condition_key], list) or isinstance(x[condition_key], tuple) and len(x[condition_key]) == 1:
-                    conditioner_input = x[condition_key][0]
-                    
-                else:
-                    conditioner_input = x[condition_key]
+                conditioner_inputs.append(input_dict)
 
-                conditioner_inputs.append(conditioner_input)
+            # If there's only one condition key, collapse the list of dicts to a list of values
+            if len(condition_keys) == 1:
+                single_key = condition_keys[0]
+                conditioner_inputs = [input_dict[single_key] for input_dict in conditioner_inputs]
 
             if key in self.pre_encoded_keys:
                 output[key] = [torch.stack(conditioner_inputs, dim=0).to(device), None]

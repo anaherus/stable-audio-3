@@ -1,0 +1,268 @@
+{
+    "model_type": "diffusion_cond_inpaint",
+    "sample_size": 16777216,
+    "sample_rate": 44100,
+    "audio_channels": 2,
+    "model": {
+        "pretransform": {
+            "type": "autoencoder",
+            "iterate_batch": false,
+            "chunked": true,
+            "config": {
+                "pretransform": {
+                    "type": "patched",
+                    "config": {
+                        "patch_size": 256,
+                        "channels": 2
+                    }
+                },
+                "encoder": {
+                    "type": "taae_v2",
+                    "requires_grad": false,
+                    "config": {
+                        "in_channels": 512,
+                        "channels": 256,
+                        "c_mults": [
+                            6
+                        ],
+                        "strides": [
+                            16
+                        ],
+                        "latent_dim": 256,
+                        "transformer_depths": [
+                            12
+                        ],
+                        "use_snake": false,
+                        "use_dilated_conv": false,
+                        "checkpointing": true,
+                        "conformer": false,
+                        "layer_scale": false,
+                        "differential": true,
+                        "conv_bias": false,
+                        "mapping_style": "none",
+                        "dim_heads": 64,
+                        "enable_inner_layer_dropout": false,
+                        "sliding_window": [
+                            1,
+                            1
+                        ],
+                        "variable_stride": true,
+                        "use_flash": true,
+                        "mask_noise": 0.001
+                    }
+                },
+                "decoder": {
+                    "type": "taae_v2",
+                    "requires_grad": false,
+                    "config": {
+                        "out_channels": 512,
+                        "channels": 256,
+                        "c_mults": [
+                            6
+                        ],
+                        "strides": [
+                            16
+                        ],
+                        "latent_dim": 256,
+                        "transformer_depths": [
+                            12
+                        ],
+                        "sinusoidal_blocks": [
+                            8
+                        ],
+                        "use_snake": false,
+                        "use_dilated_conv": false,
+                        "checkpointing": false,
+                        "conformer": false,
+                        "layer_scale": false,
+                        "differential": true,
+                        "conv_bias": false,
+                        "mapping_style": "none",
+                        "dim_heads": 64,
+                        "enable_inner_layer_dropout": false,
+                        "sliding_window": [
+                            1,
+                            1
+                        ],
+                        "variable_stride": true,
+                        "use_flash": true,
+                        "mask_noise": 0.1
+                    }
+                },
+                "bottleneck": {
+                    "type": "softnorm",
+                    "config": {
+                        "dim": 256,
+                        "noise_augment_dim": 0,
+                        "noise_regularize": true,
+                        "auto_scale": true,
+                        "freeze": true
+                    }
+                },
+                "latent_dim": 256,
+                "downsampling_ratio": 4096,
+                "io_channels": 2
+            }
+        },
+        "conditioning": {
+            "configs": [
+                {
+                    "id": "chroma",
+                    "type": "feature",
+                    "pre_encoded": true,
+                    "config": {
+                        "dim": 12,
+                        "channels_last": true,
+                        "filter_threshold": 0,
+                        "project_out": true,
+                        "reduce": "mean",
+                        "postnorm": 1,
+                        "topk_dropout_factor": 0.7242957949638367,
+                        "topk_dropout_width": 0.2267351467086779,
+                        "topk_dropout_p": 1.0,
+                        "expand": false
+                    }
+                },
+                {
+                    "id": "bpm",
+                    "type": "cycle",
+                    "config": {
+                        "bpm_key": "bpm",
+                        "phase_key": "seconds_start",
+                        "len_key": "seconds_total",
+                        "max_bpm": 250,
+                        "min_bpm": 20,
+                        "output_dim": 32,
+                        "n_frames": 173,
+                        "sr": 10.7666015625,
+                        "ratios": [
+                            4,
+                            3,
+                            2,
+                            1.5,
+                            1,
+                            0.666667,
+                            0.5,
+                            0.333333,
+                            0.25,
+                            0.166667,
+                            0.125,
+                            0.083333,
+                            0.0625,
+                            0.041667,
+                            0.03125,
+                            0.020833
+                        ],
+                        "channels_last": false,
+                        "project_out": true,
+                        "min_fold_bpm": 80,
+                        "none_imputation": 0.0
+                    }
+                },
+                {
+                    "id": "cl_siso",
+                    "type": "feature",
+                    "pre_encoded": true,
+                    "config": {
+                        "dim": 512,
+                        "channels_last": true,
+                        "filter_threshold": 0,
+                        "scale": 22.62443438914027
+                    }
+                },
+                {
+                    "id": "seconds_total",
+                    "type": "number",
+                    "config": {
+                        "min_val": 0,
+                        "max_val": 384,
+                        "fourier_features_type": "expo"
+                    }
+                }
+            ],
+            "cond_dim": 768,
+            "default_keys": {
+                "cl_siso": "embedding"
+            },
+            "extra_keys": {
+                "bpm": [
+                    "seconds_start",
+                    "seconds_total"
+                ]
+            }
+        },
+        "diffusion": {
+            "cross_attention_cond_ids": [
+                "seconds_total"
+            ],
+            "global_cond_ids": [
+                "seconds_total"
+            ],
+            "prepend_cond_ids": [
+                "cl_siso",
+                "chroma"
+            ],
+            "local_add_cond_ids": [
+                "inpaint_mask",
+                "inpaint_masked_input"
+            ],
+            "modular_local_cond_configs": [
+                {
+                    "id": "bpm",
+                    "dim": 32
+                }
+            ],
+            "type": "dit",
+            "diffusion_objective": "rectified_flow",
+            "mask_padding_attention": true,
+            "use_effective_length_for_schedule": true,
+            "distribution_shift_options": {
+                "min_length": 256,
+                "max_length": 4096
+            },
+            "config": {
+                "io_channels": 256,
+                "embed_dim": 1536,
+                "depth": 24,
+                "num_heads": 24,
+                "cond_token_dim": 768,
+                "global_cond_dim": 768,
+                "local_add_cond_dim": 257,
+                "prepend_cond_dim": 768,
+                "global_cond_type": "adaLN",
+                "timestep_features_type": "expo",
+                "attn_kwargs": {
+                    "qk_norm": "rms",
+                    "differential": true
+                },
+                "norm_type": "rms_norm",
+                "norm_kwargs": {
+                    "force_fp32": true
+                },
+                "ff_kwargs": {
+                    "mult": 4.0
+                },
+                "num_memory_tokens": 64
+            }
+        },
+        "io_channels": 256
+    },
+    "training": {
+        "use_ema": false,
+        "log_loss_info": false,
+        "pre_encoded": true,
+        "ot_coupling": true,
+        "silence_extension_scale_seconds": 4.0,
+        "timestep_sampler": "trunc_logit_normal",
+        "mask_loss_weight": 1.0,
+        "inpainting": {
+            "mask_kwargs": {
+                "mask_type_probabilities": [
+                    0.1,
+                    0.8,
+                    0.1
+                ]
+            }
+        }
+    }
+}

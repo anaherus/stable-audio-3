@@ -169,3 +169,6 @@ wandb/*
 .DS_Store
 *.safetensors
 .claude
+# SpliceGen adapter dev artifacts
+.dev_data/
+adapter_checkpoints/
