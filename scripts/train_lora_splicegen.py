@@ -275,8 +275,12 @@ def train(args):
         except Exception as e:
             print(f"Could not log hyperparams: {e}")
 
+    # save_top_k=1: keep only the newest checkpoint on local disk (large-rank
+    # checkpoints are multi-GB and filled the VM disk at save_top_k=-1, hanging
+    # rank 0 mid-save and timing out NCCL). The S3 history still accumulates
+    # every checkpoint, since `aws s3 sync` never deletes already-synced files.
     ckpt_callback = pl.callbacks.ModelCheckpoint(
-        every_n_train_steps=args.checkpoint_every, dirpath=checkpoint_dir, save_top_k=-1
+        every_n_train_steps=args.checkpoint_every, dirpath=checkpoint_dir, save_top_k=1
     )
 
     # Fixed demo batch: full-mask generation conditioned on batch metadata
