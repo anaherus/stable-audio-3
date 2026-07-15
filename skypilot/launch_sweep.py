@@ -251,6 +251,8 @@ def main() -> int:
     p.add_argument("--ranks", type=int, nargs="+", default=[8, 16, 64],
                    help="LoRA ranks to sweep (one managed job each)")
     p.add_argument("--adapter_type", default="dora-rows")
+    p.add_argument("--full_finetune", action="store_true",
+                   help="Full fine-tuning (no adapters): launches a single job named <name>-fullft")
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--steps", type=int, default=20_000)
     p.add_argument("--batch_size", type=int, default=32, help="per-GPU batch size")
@@ -307,8 +309,15 @@ def main() -> int:
     group = args.group or args.name
     request_ids = []
 
-    for rank in args.ranks:
-        job_name = f"{args.name}-r{rank}"
+    if args.full_finetune:
+        # Single job; --rank/--adapter_type are passed but ignored by the script.
+        jobs = [(f"{args.name}-fullft", args.ranks[0])]
+        extra_args = (args.extra_args + " --full_finetune").strip()
+    else:
+        jobs = [(f"{args.name}-r{rank}", rank) for rank in args.ranks]
+        extra_args = args.extra_args
+
+    for job_name, rank in jobs:
         run_id = job_name.replace("_", "-")  # stable wandb id => resume across preemptions
         envs = {
             **ENVS,
@@ -324,7 +333,7 @@ def main() -> int:
             "S3_CHECKPOINT_URI": f"{CHECKPOINTS_BUCKET_BASE}/{job_name}/",
             "CHECKPOINT_EVERY": str(args.checkpoint_every),
             "DEMO_EVERY": str(args.demo_every),
-            "EXTRA_ARGS": args.extra_args,
+            "EXTRA_ARGS": extra_args,
         }
 
         task = sky.Task(

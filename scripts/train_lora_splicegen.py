@@ -28,7 +28,10 @@ from stable_audio_3.loading_utils import copy_state_dict
 from stable_audio_3.model_configs import base_models
 from stable_audio_3.models.lora.utils import load_lora_checkpoint
 from stable_audio_3.training.diffusion import DiffusionCondInpaintDemoCallback
-from stable_audio_3.training.splicegen_adapter import SpliceGenAdapterTrainingWrapper
+from stable_audio_3.training.splicegen_adapter import (
+    SpliceGenAdapterTrainingWrapper,
+    SpliceGenFullFTTrainingWrapper,
+)
 
 DEFAULT_MODEL_CONFIG = Path(__file__).resolve().parent.parent / "configs" / "splicegen_prepend_medium.json"
 
@@ -46,7 +49,8 @@ EXPECTED_NEW_PATTERNS = (
 )
 
 
-def load_model(model_name: str, model_config_path: str, device: torch.device):
+def load_model(model_name: str, model_config_path: str, device: torch.device,
+               dtype: torch.dtype = torch.bfloat16):
     """Build the SpliceGen-conditioned model and load pretrained base weights.
 
     The model architecture comes from the local model config; the weights
@@ -90,7 +94,7 @@ def load_model(model_name: str, model_config_path: str, device: torch.device):
     print(f"{len(fresh)} model keys are new SpliceGen conditioning modules (trained from scratch)")
 
     copy_state_dict(model, ckpt_sd)
-    model.to(device=device, dtype=torch.bfloat16).eval().requires_grad_(False)
+    model.to(device=device, dtype=dtype).eval().requires_grad_(False)
     if model.pretransform is not None:
         model.pretransform.enable_grad = False
     return model, model_config
@@ -167,7 +171,10 @@ def train(args):
         device = torch.device(f"cuda:{local_rank}")
     else:
         device = torch.device("cpu")
-    model, model_config = load_model(args.model, args.model_config, device)
+    model, model_config = load_model(
+        args.model, args.model_config, device,
+        dtype=torch.float32 if args.full_finetune else torch.bfloat16,
+    )
 
     latent_rate = model_config["sample_rate"] / model.pretransform.downsampling_ratio
 
@@ -187,28 +194,34 @@ def train(args):
     )
 
     # Resume: explicit checkpoint > latest checkpoint found in S3
-    lora_checkpoint = args.lora_checkpoint
-    if lora_checkpoint is None and args.s3_checkpoint_uri:
+    resume_checkpoint = args.lora_checkpoint
+    if resume_checkpoint is None and args.s3_checkpoint_uri:
         latest = find_latest_s3_checkpoint(args.s3_checkpoint_uri)
         if latest is not None:
             local_resume = os.path.join(args.save_dir, "resume.ckpt")
             os.makedirs(args.save_dir, exist_ok=True)
             print(f"Resuming from {latest}")
             subprocess.run(["aws", "s3", "cp", latest, local_resume, "--only-show-errors"], check=True)
-            lora_checkpoint = local_resume
+            resume_checkpoint = local_resume
 
     lora_state_dict = None
-    if lora_checkpoint:
-        lora_state_dict, _ = load_lora_checkpoint(lora_checkpoint)
+    if resume_checkpoint and not args.full_finetune:
+        # Adapter checkpoints hold only LoRA + from-scratch tensors; load them
+        # into the model. Full-FT checkpoints are complete Lightning checkpoints
+        # and are instead passed to trainer.fit(ckpt_path=...) below, which also
+        # restores the optimizer and global step.
+        lora_state_dict, _ = load_lora_checkpoint(resume_checkpoint)
 
-    lora_config = {
-        "rank": args.rank,
-        "alpha": args.lora_alpha if args.lora_alpha is not None else args.rank,
-        "adapter_type": args.adapter_type,
-        "dropout": args.dropout,
-        "include": args.include,
-        "exclude": args.exclude,
-    }
+    lora_config = None
+    if not args.full_finetune:
+        lora_config = {
+            "rank": args.rank,
+            "alpha": args.lora_alpha if args.lora_alpha is not None else args.rank,
+            "adapter_type": args.adapter_type,
+            "dropout": args.dropout,
+            "include": args.include,
+            "exclude": args.exclude,
+        }
     optimizer_config = {
         "diffusion": {
             "optimizer": {
@@ -224,7 +237,8 @@ def train(args):
 
     training_config = model_config.get("training", {})
 
-    training_wrapper = SpliceGenAdapterTrainingWrapper(
+    wrapper_cls = SpliceGenFullFTTrainingWrapper if args.full_finetune else SpliceGenAdapterTrainingWrapper
+    training_wrapper = wrapper_cls(
         model,
         extra_lr=args.extra_lr,
         mask_loss_weight=training_config.get("mask_loss_weight", 1.0),
@@ -335,14 +349,19 @@ def train(args):
         num_sanity_val_steps=0,
     )
 
-    trainer.fit(training_wrapper, dataloader)
+    ckpt_path = resume_checkpoint if args.full_finetune else None
+    trainer.fit(training_wrapper, dataloader, ckpt_path=ckpt_path)
 
-    # Final adapter export
+    # Final export
     if trainer.global_rank == 0:
         os.makedirs(checkpoint_dir, exist_ok=True)
-        export_path = os.path.join(checkpoint_dir, "adapter_final.safetensors")
-        training_wrapper.export_adapter_safetensors(export_path)
-        print(f"Exported final adapter to {export_path}")
+        if args.full_finetune:
+            export_path = os.path.join(checkpoint_dir, "model_final.safetensors")
+            training_wrapper.export_model_safetensors(export_path)
+        else:
+            export_path = os.path.join(checkpoint_dir, "adapter_final.safetensors")
+            training_wrapper.export_adapter_safetensors(export_path)
+        print(f"Exported final weights to {export_path}")
 
 
 def main():
@@ -356,7 +375,9 @@ def main():
                    help="Path to SAME-L silence_pad_embed.pt (latent silence padding). Zeros if omitted.")
     p.add_argument("--latent_frames", type=int, default=173,
                    help="Latent crop/pad length in frames (173 = ~16s at SAME-L rate)")
-    # Adapter
+    # Adapter (ignored with --full_finetune)
+    p.add_argument("--full_finetune", action="store_true",
+                   help="Train all model weights (no adapters); checkpoints are full Lightning checkpoints")
     p.add_argument("--rank", type=int, default=16)
     p.add_argument("--lora_alpha", type=float, default=None)
     p.add_argument("--adapter_type",

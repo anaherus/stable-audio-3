@@ -157,6 +157,77 @@ class SpliceGenAdapterTrainingWrapper(DiffusionCondTrainingWrapper):
         save_lora_safetensors(state_dict, self.lora_config, path)
 
 
+class SpliceGenFullFTTrainingWrapper(DiffusionCondTrainingWrapper):
+    """Full fine-tuning wrapper for the SpliceGen-conditioned model (no adapters).
+
+    Trains every DiT and conditioner parameter in fp32 (pretransform stays
+    frozen). The from-scratch conditioning modules get their own optimizer
+    parameter group so they can use a higher learning rate than the pretrained
+    weights. Checkpointing is the default Lightning full checkpoint (weights +
+    optimizer + trainer state), so resume restores the global step.
+
+    Args:
+        extra_lr: Learning rate for the from-scratch conditioning modules.
+            Defaults to the base optimizer learning rate.
+    """
+
+    def __init__(self, *args, extra_lr: tp.Optional[float] = None, **kwargs):
+        if kwargs.get("lora_config") is not None:
+            raise ValueError("SpliceGenFullFTTrainingWrapper does not take a lora_config")
+        super().__init__(*args, **kwargs)
+        self.extra_lr = extra_lr
+
+        for module in (self.diffusion.model, self.diffusion.conditioner):
+            for param in module.parameters():
+                param.data = param.data.to(torch.float32)
+                param.requires_grad_(True)
+            module.train()
+        if self.diffusion.pretransform is not None:
+            self.diffusion.pretransform.requires_grad_(False)
+
+        n_total = sum(
+            p.numel()
+            for m in (self.diffusion.model, self.diffusion.conditioner)
+            for p in m.parameters()
+            if p.requires_grad
+        )
+        print(f"SpliceGen full FT: {n_total / 1e6:.2f}M trainable params")
+
+    def configure_optimizers(self):
+        diffusion_opt_config = self.optimizer_configs["diffusion"]
+        base_lr = diffusion_opt_config["optimizer"]["config"].get("lr")
+
+        base_params, extra_params = [], []
+        for prefix, module in (("model", self.diffusion.model), ("conditioner", self.diffusion.conditioner)):
+            for name, param in module.named_parameters():
+                if not param.requires_grad:
+                    continue
+                full_name = f"{prefix}.{name}"
+                (extra_params if name_is_adapter_extra(full_name) else base_params).append(param)
+
+        param_groups = [
+            {"params": base_params},
+            {"params": extra_params, "lr": self.extra_lr if self.extra_lr is not None else base_lr},
+        ]
+        opt_diff = create_optimizer_from_config(diffusion_opt_config["optimizer"], param_groups)
+
+        if "scheduler" in diffusion_opt_config:
+            sched_diff = create_scheduler_from_config(diffusion_opt_config["scheduler"], opt_diff)
+            return [opt_diff], [{"scheduler": sched_diff, "interval": "step"}]
+
+        return [opt_diff]
+
+    def export_model_safetensors(self, path):
+        """Export the full fine-tuned model (DiT + conditioner) as safetensors."""
+        from safetensors.torch import save_file
+
+        state_dict = {
+            **{f"model.{k}": v.contiguous() for k, v in self.diffusion.model.state_dict().items()},
+            **{f"conditioner.{k}": v.contiguous() for k, v in self.diffusion.conditioner.state_dict().items()},
+        }
+        save_file(state_dict, path)
+
+
 def load_adapter_into_model(model, state_dict):
     """Load a SpliceGen adapter checkpoint state dict into a diffusion wrapper.
 
