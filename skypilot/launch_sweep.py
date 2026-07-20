@@ -262,6 +262,9 @@ def main() -> int:
     p.add_argument("--checkpoint_every", type=int, default=1000)
     p.add_argument("--demo_every", type=int, default=1000)
     p.add_argument("--extra_args", default="", help="extra CLI args appended to the train command")
+    p.add_argument("--run_id", default=None,
+                   help="wandb run id override (single-job launches only; default: job name). "
+                        "Use when continuing a run whose id differs from its name.")
     p.add_argument("--git-url", dest="git_url",
                    default=os.environ.get("SA3_FORK_URL", ""),
                    help="git URL of a stable-audio-3 fork to clone on the VM. "
@@ -317,8 +320,12 @@ def main() -> int:
         jobs = [(f"{args.name}-r{rank}", rank) for rank in args.ranks]
         extra_args = args.extra_args
 
+    if args.run_id and len(jobs) > 1:
+        sys.exit("error: --run_id only makes sense for single-job launches")
+
     for job_name, rank in jobs:
-        run_id = job_name.replace("_", "-")  # stable wandb id => resume across preemptions
+        # Stable wandb id => resume across preemptions
+        run_id = args.run_id or job_name.replace("_", "-")
         envs = {
             **ENVS,
             "LORA_RANK": str(rank),

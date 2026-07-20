@@ -73,6 +73,9 @@ class SpliceGenAdapterTrainingWrapper(DiffusionCondTrainingWrapper):
         super().__init__(*args, **kwargs)
 
         self.extra_lr = extra_lr
+        # Checkpoints slim `state_dict` down to adapter tensors (see
+        # on_save_checkpoint); Lightning's restore must not require full coverage.
+        self.strict_loading = False
 
         if self.lora_config is None:
             raise ValueError("SpliceGenAdapterTrainingWrapper requires a lora_config")
@@ -131,11 +134,16 @@ class SpliceGenAdapterTrainingWrapper(DiffusionCondTrainingWrapper):
         return [opt_diff]
 
     def on_save_checkpoint(self, checkpoint):
-        # LoRA tensors + config (mirrors the parent implementation), plus the
-        # from-scratch module weights. Key spaces follow the parent convention:
-        # keys are relative to diffusion.model / diffusion.conditioner so that
-        # load_state_dict(strict=False) on both modules restores everything.
-        checkpoint.clear()
+        # Slim `state_dict` down to LoRA tensors + from-scratch module weights
+        # (key spaces follow the parent convention: keys relative to
+        # diffusion.model / diffusion.conditioner so load_state_dict(strict=False)
+        # on both modules restores everything). Unlike the original
+        # weights-only implementation, everything else Lightning saved
+        # (loops, optimizer_states, lr_schedulers, ...) is kept, so
+        # trainer.fit(ckpt_path=...) restores the global step and optimizer —
+        # spot-preemption resume no longer restarts the step budget from 0.
+        # The optimizer state only covers trainable params, so checkpoints grow
+        # by ~2x the adapter size, not by the full model.
         checkpoint["state_dict"] = {
             **get_lora_state_dict(self.diffusion.model),
             **get_lora_state_dict(self.diffusion.conditioner),
@@ -143,6 +151,15 @@ class SpliceGenAdapterTrainingWrapper(DiffusionCondTrainingWrapper):
             **get_adapter_extra_state_dict(self.diffusion.conditioner),
         }
         checkpoint["lora_config"] = self.lora_config
+
+    def on_load_checkpoint(self, checkpoint):
+        # Adapter weights live in a module-relative key space that Lightning's
+        # own state_dict load (strict_loading=False) cannot map; apply them
+        # here. Weight-only checkpoints (pre trainer-state fix) take the
+        # manual pre-fit load path in the train script instead.
+        state_dict = checkpoint.get("state_dict") or {}
+        if state_dict:
+            load_adapter_into_model(self.diffusion, dict(state_dict))
 
     def export_adapter_safetensors(self, path):
         """Export LoRA + from-scratch tensors as safetensors with embedded config."""

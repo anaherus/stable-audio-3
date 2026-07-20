@@ -15,6 +15,7 @@ os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 import argparse
 import itertools
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -103,6 +104,28 @@ def load_model(model_name: str, model_config_path: str, device: torch.device,
 class ExceptionCallback(pl.Callback):
     def on_exception(self, trainer, module, err):
         print(f"{type(err).__name__}: {err}")
+
+
+class InitialStepCallback(pl.Callback):
+    """Fast-forward the step counters when resuming from a weights-only checkpoint.
+
+    Adapter checkpoints saved before the trainer-state fix carry no loop state,
+    so Lightning would restart from step 0 — retraining the full step budget
+    and breaking the wandb step axis. This sets the optimizer-step and
+    logging-step counters to the checkpoint's step so max_steps and wandb
+    continue from where the previous run stopped. (Optimizer moment estimates
+    are still fresh; they re-warm within a few hundred steps.)
+    """
+
+    def __init__(self, initial_step: int):
+        self.initial_step = initial_step
+
+    def on_train_start(self, trainer, module):
+        epoch_loop = trainer.fit_loop.epoch_loop
+        epoch_loop._batches_that_stepped = self.initial_step
+        step_progress = epoch_loop.automatic_optimization.optim_progress.optimizer.step
+        step_progress.total.completed = self.initial_step
+        print(f"Fast-forwarded global step to {self.initial_step}")
 
 
 class S3SyncCallback(pl.Callback):
@@ -195,6 +218,7 @@ def train(args):
 
     # Resume: explicit checkpoint > latest checkpoint found in S3
     resume_checkpoint = args.lora_checkpoint
+    resume_source_name = args.lora_checkpoint  # keeps the step-bearing filename
     if resume_checkpoint is None and args.s3_checkpoint_uri:
         latest = find_latest_s3_checkpoint(args.s3_checkpoint_uri)
         if latest is not None:
@@ -203,14 +227,33 @@ def train(args):
             print(f"Resuming from {latest}")
             subprocess.run(["aws", "s3", "cp", latest, local_resume, "--only-show-errors"], check=True)
             resume_checkpoint = local_resume
+            resume_source_name = latest
 
     lora_state_dict = None
+    resume_has_trainer_state = args.full_finetune  # full-FT ckpts always carry it
+    initial_step = args.initial_step
     if resume_checkpoint and not args.full_finetune:
-        # Adapter checkpoints hold only LoRA + from-scratch tensors; load them
-        # into the model. Full-FT checkpoints are complete Lightning checkpoints
-        # and are instead passed to trainer.fit(ckpt_path=...) below, which also
-        # restores the optimizer and global step.
-        lora_state_dict, _ = load_lora_checkpoint(resume_checkpoint)
+        # Adapter checkpoints saved after the trainer-state fix are full
+        # Lightning checkpoints (with a slimmed state_dict) and go through
+        # trainer.fit(ckpt_path=...), which restores loops + optimizer and the
+        # adapter weights (wrapper's on_load_checkpoint). Weights-only adapter
+        # checkpoints (pre-fix) are loaded into the model here, and the step
+        # counter is fast-forwarded from the filename via InitialStepCallback.
+        if resume_checkpoint.endswith(".ckpt"):
+            peek = torch.load(resume_checkpoint, map_location="cpu", weights_only=False, mmap=True)
+            resume_has_trainer_state = "loops" in peek
+            del peek
+        if not resume_has_trainer_state:
+            lora_state_dict, _ = load_lora_checkpoint(resume_checkpoint)
+            if initial_step is None:
+                m = re.search(r"step=(\d+)", resume_source_name or "")
+                if m:
+                    initial_step = int(m.group(1))
+                else:
+                    print(
+                        "WARNING: resuming from a weights-only checkpoint without a "
+                        "step=N filename or --initial_step; step counter restarts at 0"
+                    )
 
     lora_config = None
     if not args.full_finetune:
@@ -328,6 +371,9 @@ def train(args):
 
     callbacks = [ckpt_callback, ExceptionCallback(), demo_callback, pl.callbacks.ModelSummary(max_depth=2)]
 
+    if resume_checkpoint and not resume_has_trainer_state and initial_step:
+        callbacks.append(InitialStepCallback(initial_step))
+
     if args.s3_checkpoint_uri:
         callbacks.append(
             S3SyncCallback(checkpoint_dir, args.s3_checkpoint_uri, every_n_train_steps=args.checkpoint_every)
@@ -349,7 +395,7 @@ def train(args):
         num_sanity_val_steps=0,
     )
 
-    ckpt_path = resume_checkpoint if args.full_finetune else None
+    ckpt_path = resume_checkpoint if resume_has_trainer_state else None
     trainer.fit(training_wrapper, dataloader, ckpt_path=ckpt_path)
 
     # Final export
@@ -388,6 +434,9 @@ def main():
     p.add_argument("--exclude", nargs="*", default=None)
     p.add_argument("--base_precision", choices=["bf16", "bfloat16", "fp16", "float16"], default="bf16")
     p.add_argument("--lora_checkpoint", default=None, help="Adapter checkpoint to resume from")
+    p.add_argument("--initial_step", type=int, default=None,
+                   help="Fast-forward the step counter when resuming a weights-only adapter "
+                        "checkpoint (default: parsed from the checkpoint's step=N filename)")
     # Optimization
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--extra_lr", type=float, default=None,
