@@ -39,7 +39,9 @@ def package_adapter(ckpt_path: str, model_config_path: str) -> tuple[dict, dict]
     device = torch.device("cpu")
     model, model_config = load_model("medium-base", model_config_path, device, dtype=torch.float32)
 
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    # mmap: post-resume-fix checkpoints also carry optimizer/loop state (can be
+    # ~3x the adapter size); only the state_dict tensors get materialized.
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False, mmap=True)
     lora_config = ckpt["lora_config"]
     rank = lora_config["rank"]
     alpha = lora_config.get("alpha", rank)
