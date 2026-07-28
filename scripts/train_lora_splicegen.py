@@ -51,12 +51,17 @@ EXPECTED_NEW_PATTERNS = (
 
 
 def load_model(model_name: str, model_config_path: str, device: torch.device,
-               dtype: torch.dtype = torch.bfloat16):
+               dtype: torch.dtype = torch.bfloat16, from_scratch: bool = False):
     """Build the SpliceGen-conditioned model and load pretrained base weights.
 
     The model architecture comes from the local model config; the weights
     from the HF base checkpoint. Verifies that the only key mismatches are the
     removed prompt conditioner and the new conditioning modules.
+
+    With ``from_scratch=True``, only the ``pretransform.*`` weights (the SAME-L
+    autoencoder the dataset latents were encoded with — needed for demo
+    decoding) are loaded from the base checkpoint; the DiT and all conditioners
+    keep their fresh random initialization.
     """
     if model_name not in base_models:
         raise ValueError(f"Requires a base model. Got '{model_name}', valid: {list(base_models)}")
@@ -68,6 +73,24 @@ def load_model(model_name: str, model_config_path: str, device: torch.device,
     model = create_diffusion_cond_from_config(model_config)
 
     ckpt_sd = load_file(local_ckpt)
+
+    if from_scratch:
+        pretransform_sd = {k: v for k, v in ckpt_sd.items() if k.startswith("pretransform.")}
+        if not pretransform_sd:
+            raise RuntimeError(
+                f"No pretransform.* keys found in the base checkpoint {local_ckpt}; "
+                "cannot load the autoencoder for a from-scratch run"
+            )
+        print(
+            f"From-scratch init: loading only {len(pretransform_sd)} pretransform tensors "
+            f"from the base checkpoint; DiT + conditioners stay randomly initialized"
+        )
+        copy_state_dict(model, pretransform_sd)
+        model.to(device=device, dtype=dtype).eval().requires_grad_(False)
+        if model.pretransform is not None:
+            model.pretransform.enable_grad = False
+        return model, model_config
+
     model_sd_keys = set(model.state_dict().keys())
     model_sd = model.state_dict()
 
@@ -194,9 +217,13 @@ def train(args):
         device = torch.device(f"cuda:{local_rank}")
     else:
         device = torch.device("cpu")
+    if args.from_scratch and not args.full_finetune:
+        raise ValueError("--from_scratch requires --full_finetune (adapters on random weights make no sense)")
+
     model, model_config = load_model(
         args.model, args.model_config, device,
         dtype=torch.float32 if args.full_finetune else torch.bfloat16,
+        from_scratch=args.from_scratch,
     )
 
     latent_rate = model_config["sample_rate"] / model.pretransform.downsampling_ratio
@@ -424,6 +451,9 @@ def main():
     # Adapter (ignored with --full_finetune)
     p.add_argument("--full_finetune", action="store_true",
                    help="Train all model weights (no adapters); checkpoints are full Lightning checkpoints")
+    p.add_argument("--from_scratch", action="store_true",
+                   help="Randomly initialize the DiT + conditioners (only the pretransform is loaded "
+                        "from the base checkpoint). Requires --full_finetune.")
     p.add_argument("--rank", type=int, default=16)
     p.add_argument("--lora_alpha", type=float, default=None)
     p.add_argument("--adapter_type",

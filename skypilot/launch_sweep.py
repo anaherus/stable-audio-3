@@ -253,6 +253,9 @@ def main() -> int:
     p.add_argument("--adapter_type", default="dora-rows")
     p.add_argument("--full_finetune", action="store_true",
                    help="Full fine-tuning (no adapters): launches a single job named <name>-fullft")
+    p.add_argument("--from_scratch", action="store_true",
+                   help="Full training from random init (pretransform-only base load): "
+                        "launches a single job named <name>-scratch")
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--steps", type=int, default=20_000)
     p.add_argument("--batch_size", type=int, default=32, help="per-GPU batch size")
@@ -312,7 +315,11 @@ def main() -> int:
     group = args.group or args.name
     request_ids = []
 
-    if args.full_finetune:
+    if args.from_scratch:
+        # Single job; --rank/--adapter_type are passed but ignored by the script.
+        jobs = [(f"{args.name}-scratch", args.ranks[0])]
+        extra_args = (args.extra_args + " --full_finetune --from_scratch").strip()
+    elif args.full_finetune:
         # Single job; --rank/--adapter_type are passed but ignored by the script.
         jobs = [(f"{args.name}-fullft", args.ranks[0])]
         extra_args = (args.extra_args + " --full_finetune").strip()
